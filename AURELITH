@@ -1,0 +1,647 @@
+# AURELITH
+### Secure Configuration Auditor
+
+A lightweight security auditing tool designed to detect exposed secrets, insecure configuration patterns, and potential risks in application configuration files.
+
+**Key Features**
+- Detect potential API keys, tokens, passwords, and private keys.
+- Identify insecure configuration patterns.
+- Scan JSON, YAML, TOML, INI, ENV, and common configuration files.
+- Generate structured JSON security reports.
+- Support recursive directory scanning.
+- Run locally without external dependencies.
+- Integrate easily into development workflows and CI pipelines.
+
+**Requirements**
+- Python 3.10+
+- Standard library only
+
+**Project Structure**
+```text
+aurelith/
+├── aurelith.py
+├── README.md
+├── requirements.txt
+└── .gitignore
+```
+
+### File 1: `aurelith.py`
+
+```python
+#!/usr/bin/env python3
+"""
+AURELITH - Secure Configuration Auditor
+
+A lightweight configuration security scanner.
+Uses Python's standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable
+
+
+VERSION = "1.0.0"
+
+SUPPORTED_EXTENSIONS = {
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".env",
+    ".cfg",
+    ".conf",
+    ".properties",
+    ".xml",
+}
+
+IGNORED_DIRECTORIES = {
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".idea",
+    ".vscode",
+}
+
+SECRET_PATTERNS = [
+    (
+        "PRIVATE_KEY",
+        re.compile(
+            r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?"
+            r"PRIVATE KEY-----"
+        ),
+    ),
+    (
+        "API_KEY",
+        re.compile(
+            r"""(?i)\b(?:api[_-]?key|access[_-]?token|
+            auth[_-]?token)\b\s*[:=]\s*["']?([^\s"'#]{12,})"""
+            .replace("\n", "")
+        ),
+    ),
+    (
+        "PASSWORD",
+        re.compile(
+            r"""(?i)\b(?:password|passwd|pwd)\b\s*[:=]\s*
+            ["']?([^\s"'#]{4,})""".replace("\n", "")
+        ),
+    ),
+    (
+        "SECRET",
+        re.compile(
+            r"""(?i)\b(?:client[_-]?secret|app[_-]?secret|
+            signing[_-]?secret)\b\s*[:=]\s*
+            ["']?([^\s"'#]{8,})""".replace("\n", "")
+        ),
+    ),
+]
+
+INSECURE_PATTERNS = [
+    (
+        "TLS_VERIFICATION_DISABLED",
+        re.compile(
+            r"""(?i)\b(?:verify|ssl_verify|tls_verify|
+            certificate_verification)\b\s*[:=]\s*
+            ["']?(?:false|no|0|disabled)\b""".replace("\n", "")
+        ),
+        "TLS or certificate verification appears disabled.",
+    ),
+    (
+        "DEBUG_ENABLED",
+        re.compile(
+            r"""(?i)\bdebug\b\s*[:=]\s*
+            ["']?(?:true|yes|1|enabled)\b""".replace("\n", "")
+        ),
+        "Debug mode appears to be enabled.",
+    ),
+    (
+        "WILDCARD_BIND",
+        re.compile(
+            r"""(?i)\b(?:host|bind|listen|bind_address)\b\s*[:=]\s*
+            ["']?(?:0\.0\.0\.0|\*|::)\b?""".replace("\n", "")
+        ),
+        "Service may be listening on all network interfaces.",
+    ),
+]
+
+
+@dataclass(frozen=True)
+class Finding:
+    file: str
+    line: int
+    rule: str
+    severity: str
+    message: str
+
+
+@dataclass
+class ScanSummary:
+    scanned_files: int
+    findings: int
+    generated_at: str
+    version: str
+    results: list[Finding]
+
+    def to_dict(self) -> dict:
+        return {
+            "tool": "AURELITH",
+            "version": self.version,
+            "generated_at": self.generated_at,
+            "summary": {
+                "scanned_files": self.scanned_files,
+                "findings": self.findings,
+                "severity_counts": {
+                    severity: sum(
+                        item.severity == severity
+                        for item in self.results
+                    )
+                    for severity in ("HIGH", "MEDIUM", "LOW")
+                },
+            },
+            "results": [asdict(item) for item in self.results],
+        }
+
+
+def discover_files(target: Path) -> Iterable[Path]:
+    """Yield supported configuration files."""
+    if target.is_file():
+        if target.suffix.lower() in SUPPORTED_EXTENSIONS:
+            yield target
+        return
+
+    for path in target.rglob("*"):
+        if not path.is_file():
+            continue
+
+        if any(part in IGNORED_DIRECTORIES for part in path.parts):
+            continue
+
+        if path.suffix.lower() in SUPPORTED_EXTENSIONS:
+            yield path
+
+
+def is_placeholder(value: str) -> bool:
+    """Avoid reporting common example and placeholder values."""
+    normalized = value.strip().lower()
+
+    placeholders = {
+        "",
+        "null",
+        "none",
+        "changeme",
+        "change_me",
+        "your_api_key",
+        "your-secret",
+        "your_secret",
+        "example",
+        "placeholder",
+        "redacted",
+        "********",
+        "${api_key}",
+        "${secret}",
+        "${password}",
+    }
+
+    return (
+        normalized in placeholders
+        or normalized.startswith("${")
+        or normalized.startswith("your_")
+        or normalized.startswith("<")
+    )
+
+
+def redact(line: str) -> str:
+    """Prevent raw secret values from appearing in reports."""
+    sanitized = line
+
+    for _, pattern in SECRET_PATTERNS:
+        sanitized = pattern.sub(
+            lambda match: (
+                match.group(0)[:match.start(1) - match.start(0)]
+                + "[REDACTED]"
+                if match.lastindex
+                else "[REDACTED]"
+            ),
+            sanitized,
+        )
+
+    return sanitized.strip()[:240]
+
+
+def inspect_line(
+    line: str,
+    file_path: str,
+    line_number: int,
+) -> list[Finding]:
+    """Inspect one line and return matching security findings."""
+    findings: list[Finding] = []
+
+    stripped = line.strip()
+
+    if not stripped or stripped.startswith(("#", "//", ";")):
+        return findings
+
+    for rule, pattern in SECRET_PATTERNS:
+        match = pattern.search(line)
+
+        if not match:
+            continue
+
+        captured_value = (
+            match.group(1)
+            if match.lastindex
+            else match.group(0)
+        )
+
+        if is_placeholder(captured_value):
+            continue
+
+        findings.append(
+            Finding(
+                file=file_path,
+                line=line_number,
+                rule=rule,
+                severity="HIGH",
+                message="Potential exposed secret detected: "
+                + redact(line),
+            )
+        )
+
+    for rule, pattern, message in INSECURE_PATTERNS:
+        if pattern.search(line):
+            findings.append(
+                Finding(
+                    file=file_path,
+                    line=line_number,
+                    rule=rule,
+                    severity="MEDIUM",
+                    message=message,
+                )
+            )
+
+    return findings
+
+
+def scan_file(path: Path, root: Path) -> list[Finding]:
+    """Scan a configuration file safely."""
+    try:
+        content = path.read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as exc:
+        print(
+            f"[WARNING] Cannot read {path}: {exc}",
+            file=sys.stderr,
+        )
+        return []
+
+    try:
+        relative_path = str(path.relative_to(root))
+    except ValueError:
+        relative_path = path.name
+
+    findings: list[Finding] = []
+
+    for number, line in enumerate(content.splitlines(), start=1):
+        findings.extend(
+            inspect_line(line, relative_path, number)
+        )
+
+    return findings
+
+
+def run_scan(target: Path) -> ScanSummary:
+    """Run a scan and return its summary."""
+    files = sorted(discover_files(target))
+    findings: list[Finding] = []
+
+    for path in files:
+        findings.extend(scan_file(path, target if target.is_dir() else target.parent))
+
+    return ScanSummary(
+        scanned_files=len(files),
+        findings=len(findings),
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        version=VERSION,
+        results=findings,
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="aurelith",
+        description="Audit application configuration files for "
+        "potential security risks.",
+    )
+
+    parser.add_argument(
+        "target",
+        type=Path,
+        help="Configuration file or directory to scan.",
+    )
+
+    parser.add_argument(
+        "--json",
+        dest="json_output",
+        type=Path,
+        help="Write the complete report to a JSON file.",
+    )
+
+    parser.add_argument(
+        "--fail-on-findings",
+        action="store_true",
+        help="Return exit code 1 when findings are detected.",
+    )
+
+    args = parser.parse_args()
+
+    target = args.target.expanduser().resolve()
+
+    if not target.exists():
+        parser.error(f"Target does not exist: {target}")
+
+    if not target.is_file() and not target.is_dir():
+        parser.error("Target must be a file or directory.")
+
+    report = run_scan(target)
+    output = report.to_dict()
+
+    print("AURELITH Security Audit")
+    print("=" * 28)
+    print(f"Files scanned : {report.scanned_files}")
+    print(f"Findings      : {report.findings}")
+    print()
+
+    for finding in report.results:
+        print(
+            f"[{finding.severity}] "
+            f"{finding.file}:{finding.line} "
+            f"{finding.rule}"
+        )
+        print(f"  {finding.message}")
+
+    if not report.results:
+        print("No matching patterns detected.")
+
+    if args.json_output:
+        destination = args.json_output.expanduser().resolve()
+
+        try:
+            destination.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            destination.write_text(
+                json.dumps(output, indent=2),
+                encoding="utf-8",
+            )
+            print(f"\nJSON report saved to: {destination}")
+        except OSError as exc:
+            print(
+                f"Failed to write JSON report: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+
+    if args.fail_on_findings and report.findings:
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+### File 2: `README.md`
+
+```markdown
+# AURELITH
+
+**Secure Configuration Auditor**
+
+AURELITH is a lightweight, dependency-free Python utility for
+identifying potential security issues in application configuration
+files.
+
+It helps developers detect exposed credentials and selected
+insecure configuration patterns before deployment.
+
+## Features
+
+- Detect potential API keys, passwords, tokens, and private keys.
+- Identify selected insecure TLS and debug configurations.
+- Scan individual files or entire directories.
+- Generate machine-readable JSON reports.
+- Support CI pipelines through meaningful exit codes.
+- Use Python's standard library only.
+- Avoid printing complete detected credentials in findings.
+
+## Requirements
+
+- Python 3.10 or newer
+- No third-party dependencies
+
+## Installation
+
+Clone the repository:
+
+    git clone <YOUR_REPOSITORY_URL>
+    cd aurelith
+
+No installation step is required.
+
+## Usage
+
+Scan a directory:
+
+    python aurelith.py ./config
+
+Scan a single file:
+
+    python aurelith.py ./config/.env
+
+Export a JSON report:
+
+    python aurelith.py ./config --json report.json
+
+Return a non-zero exit code when findings exist:
+
+    python aurelith.py ./config --fail-on-findings
+
+Combine JSON reporting and CI-friendly exit codes:
+
+    python aurelith.py ./config \
+        --json report.json \
+        --fail-on-findings
+
+## Supported File Extensions
+
+- JSON
+- YAML
+- TOML
+- INI
+- ENV
+- CFG
+- CONF
+- Properties
+- XML
+
+Files are selected by extension. The scanner uses text-based
+pattern matching rather than fully parsing every file format.
+
+## Example Output
+
+    AURELITH Security Audit
+    ============================
+    Files scanned : 3
+    Findings      : 2
+
+    [HIGH] .env:4 API_KEY
+      Potential exposed secret detected: API_KEY=[REDACTED]
+
+    [MEDIUM] app.conf:12 DEBUG_ENABLED
+      Debug mode appears to be enabled.
+
+## JSON Report
+
+Reports include:
+
+- Tool version
+- Scan timestamp
+- Number of scanned files
+- Total findings
+- Severity counts
+- File locations and rule identifiers
+
+## Security Considerations
+
+AURELITH is a pattern-based auditing aid, not a complete security
+scanner.
+
+It may produce false positives or miss secrets that do not match
+its detection rules. Always review findings manually.
+
+Do not upload real credentials or sensitive configuration files
+to public repositories.
+
+Rotate any credential that has been exposed. Removing a secret
+from the latest commit does not necessarily remove it from Git
+history.
+
+The scanner does not execute scanned files or make network requests.
+
+## Limitations
+
+- Pattern matching is not equivalent to semantic analysis.
+- YAML and other formats are not fully parsed.
+- Encoded, split, or dynamically constructed secrets may be missed.
+- Network exposure and runtime security are not assessed.
+- The current implementation does not guarantee complete
+  redaction of every possible secret format.
+
+## Roadmap
+
+- Configurable detection rules
+- SARIF report support
+- Unit test coverage
+- Git pre-commit integration
+- CI workflow examples
+- Baseline comparison for existing findings
+
+## License
+
+MIT License
+
+Copyright (c) 2026 AURELITH Contributors
+
+Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated documentation
+files, to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of the
+Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT.
+```
+
+### File 3: `requirements.txt`
+
+```text
+# AURELITH uses only Python's standard library.
+# No external dependencies are required.
+```
+
+### File 4: `.gitignore`
+
+```gitignore
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDEs
+.idea/
+.vscode/
+
+# Operating systems
+.DS_Store
+Thumbs.db
+
+# Test and coverage artifacts
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Local reports and secrets
+report.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+```
+
+## Publishing on GitHub
+
+1. Create a new public repository named `aurelith`.
+2. Add the four files above, preserving their filenames.
+3. Review the code and test it with sample configuration files.
+4. Add a repository description:
+
+   `A lightweight Python security auditor for application configuration files.`
+
+5. Suggested topics:
+
+   `python`, `cybersecurity`, `security-tools`, `configuration-auditing`, `developer-tools`
+
+6. Commit the project and publish it.
+
+**Important:** Before presenting this as production-ready security tooling, correct and test the detection rules, add automated unit tests, and verify redaction behavior against realistic examples. Pattern-based detection alone cannot guarantee that every secret is found or safely redacted.
